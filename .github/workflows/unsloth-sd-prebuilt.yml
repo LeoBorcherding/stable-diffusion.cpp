@@ -720,7 +720,12 @@ jobs:
           python3 -m venv .rocm
           . .rocm/bin/activate
           python -m pip install -q --upgrade pip
-          python -m pip install -q --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel]==${ROCM_VERSION}"
+          # libraries/devel carry no GPU code: rocBLAS/hipBLASLt kernels and kpack archives come
+          # from one rocm-sdk-device-<gfx> wheel per target, linked into the devel tree by
+          # `rocm-sdk path`.
+          DEVICE="$(echo "$GPU_TARGETS" | sed 's/;/,device-/g; s/^/device-/')"
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "rocm[libraries,devel,${DEVICE}]==${ROCM_VERSION}"
           ROCM_PATH="$(rocm-sdk path --root)"
           {
             echo "ROCM_PATH=$ROCM_PATH"
@@ -767,40 +772,53 @@ jobs:
           cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server
           ccache --show-stats || true
 
-      - name: Bundle the ROCm runtime beside the binaries
+      - name: Stage the bundle with the ROCm runtime
         run: |
           set -euo pipefail
           BIN="${GITHUB_WORKSPACE}/src/build/bin"
-          # ldd walks the closure and ggml is static here. No "$BIN"/*.so: it matches nothing,
-          # and ldd failing on the literal pattern aborts the step under pipefail.
-          ldd "$BIN"/sd-cli "$BIN"/sd-server 2>/dev/null \
+          STAGE="${GITHUB_WORKSPACE}/rocm-bundle"
+          rm -rf "$STAGE" && mkdir -p "$STAGE/lib" "$STAGE/.kpack"
+          cp "$BIN/sd-cli" "$BIN/sd-server" "$STAGE/"
+          # ldd walks the closure and ggml is static here, so the two binaries are the whole list.
+          ldd "$STAGE/sd-cli" "$STAGE/sd-server" \
             | awk -v r="$ROCM_PATH/" 'index($3, r) == 1 { print $3 }' | sort -u > "$RUNNER_TEMP/rocm-libs.txt"
           if [ ! -s "$RUNNER_TEMP/rocm-libs.txt" ]; then
             echo "ERROR: nothing resolved from $ROCM_PATH; is this a HIP build?" >&2
             exit 1
           fi
-          while read -r so; do cp -L "$so" "$BIN/$(basename "$so")"; done < "$RUNNER_TEMP/rocm-libs.txt"
-          # rocBLAS loads its kernels from <dir of librocblas>/rocblas/library at runtime.
-          mkdir -p "$BIN/rocblas"
-          cp -r "$ROCM_PATH/lib/rocblas/library" "$BIN/rocblas/"
-          if ls "$BIN"/libhipblaslt.so* >/dev/null 2>&1 && [ -d "$ROCM_PATH/lib/hipblaslt/library" ]; then
-            mkdir -p "$BIN/hipblaslt"
-            cp -r "$ROCM_PATH/lib/hipblaslt/library" "$BIN/hipblaslt/"
-          fi
-          for f in "$BIN"/sd-cli "$BIN"/sd-server "$BIN"/*.so*; do
-            [ -f "$f" ] && patchelf --set-rpath '$ORIGIN' "$f"
+          while read -r so; do cp -L "$so" "$STAGE/lib/"; done < "$RUNNER_TEMP/rocm-libs.txt"
+          # rocBLAS and hipBLASLt load kernels from <dir of the library>/<name>/library.
+          for t in rocblas hipblaslt; do
+            compgen -G "$STAGE/lib/lib$t.so*" > /dev/null || continue
+            mkdir -p "$STAGE/lib/$t"
+            cp -rL "$ROCM_PATH/lib/$t/library" "$STAGE/lib/$t/"
           done
-          echo "bundled $(wc -l < "$RUNNER_TEMP/rocm-libs.txt") ROCm libraries"
-          du -sh "$BIN"
+          # kpack-split libraries name their GPU code in .rocm_kpack_ref as
+          # ../.kpack/<name>_@GFXARCH@.kpack, relative to the library, so lib/ and .kpack/ must
+          # stay siblings in the bundle.
+          for so in "$STAGE"/lib/*.so*; do
+            objcopy -O binary --only-section=.rocm_kpack_ref "$so" "$RUNNER_TEMP/kpack_ref.bin"
+            for name in $(strings "$RUNNER_TEMP/kpack_ref.bin" | grep -o '\.kpack/[A-Za-z0-9_]*_@GFXARCH@' \
+                | sed 's#^\.kpack/##; s#_@GFXARCH@$##' | sort -u); do
+              for gfx in ${GPU_TARGETS//;/ }; do
+                cp -L "$ROCM_PATH/.kpack/${name}_${gfx}.kpack" "$STAGE/.kpack/"
+              done
+            done
+          done
+          patchelf --set-rpath '$ORIGIN/lib' "$STAGE/sd-cli" "$STAGE/sd-server"
+          for f in "$STAGE"/lib/*.so*; do patchelf --set-rpath '$ORIGIN' "$f"; done
+          echo "bundled $(wc -l < "$RUNNER_TEMP/rocm-libs.txt") ROCm libraries, $(ls "$STAGE/.kpack" | wc -l) kpack archives"
+          du -sh "$STAGE"
           # The proof the bundle stands alone: resolve with the wheel tree hidden.
-          if LD_LIBRARY_PATH= ldd "$BIN/sd-cli" | grep -i 'not found'; then
+          if LD_LIBRARY_PATH= ldd "$STAGE/sd-cli" "$STAGE/sd-server" | grep -i 'not found'; then
             echo "ERROR: unresolved libraries after bundling" >&2
             exit 1
           fi
 
       - name: Package bundle
         env:
-          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          BIN_DIR: ${{ github.workspace }}/rocm-bundle
+          KEEP_LAYOUT: "1"
           OUT_DIR: ${{ github.workspace }}/dist
           TAG: ${{ needs.resolve.outputs.tag }}
           LABEL: Linux-Ubuntu-24.04-x86_64-rocm-7.14.0

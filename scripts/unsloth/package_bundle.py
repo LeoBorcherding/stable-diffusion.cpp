@@ -16,6 +16,8 @@ script serves every OS matrix leg:
     COMMIT    source commit SHA (provenance)
     SOURCE_REPO   e.g. leejet/stable-diffusion.cpp
     LICENSE_FILE  path to the LICENSE to include (optional)
+    KEEP_LAYOUT   "1" ships every file under BIN_DIR at its relative path instead of
+                  flattening (the ROCm leg stages lib/ and .kpack/ that must stay siblings)
 
 The zip unpacks into a single named dir ``sd-<TAG>-bin-<LABEL>/`` containing the
 binaries, their sibling runtime libs, LICENSE, and an UNSLOTH_BUILD.txt provenance
@@ -35,8 +37,6 @@ from pathlib import Path
 # (static builds usually have none; Metal / a shared ggml can add a few).
 _BINARIES = ("sd-cli", "sd-server", "sd-cli.exe", "sd-server.exe")
 _LIB_SUFFIXES = (".dylib", ".so", ".dll", ".metal", ".metallib")
-# ROCm kernel trees (<dir of librocblas>/rocblas/library) keep their layout; all else is flattened.
-_KERNEL_TREES = ("rocblas", "hipblaslt")
 
 _FINGERPRINT = "Compiled by the Unsloth team"
 
@@ -59,26 +59,16 @@ def _is_runtime_lib(name: str) -> bool:
     return ".so." in lowered
 
 
-def _kernel_tree_path(p: Path, bin_dir: Path) -> Path | None:
-    """``rocblas/library/<file>`` for a file inside a kernel tree, else None."""
-    rel = p.relative_to(bin_dir)
-    for i, part in enumerate(rel.parts[:-1]):
-        if part in _KERNEL_TREES and rel.parts[i + 1 : i + 2] == ("library",):
-            return Path(*rel.parts[i:])
-    return None
-
-
-def _collect(bin_dir: Path) -> list[tuple[Path, str]]:
+def _collect(bin_dir: Path, keep_layout: bool) -> list[tuple[Path, str]]:
     """(file, archive-relative name) for the binaries + sibling runtime libs to ship. Recurse
     so a nested bin/ layout (some generators emit build/bin/, some build/bin/Release/) is still
-    captured. Kernel trees keep their layout; everything else lands flat."""
+    captured and flattened. With keep_layout, every file ships at its path under bin_dir."""
     found: list[tuple[Path, str]] = []
     for p in sorted(bin_dir.rglob("*")):
         if not p.is_file():
             continue
-        tree = _kernel_tree_path(p, bin_dir)
-        if tree is not None:
-            found.append((p, tree.as_posix()))
+        if keep_layout:
+            found.append((p, p.relative_to(bin_dir).as_posix()))
         elif p.name in _BINARIES or _is_runtime_lib(p.name):
             found.append((p, p.name))
     return found
@@ -97,7 +87,7 @@ def main() -> int:
         print(f"package_bundle: BIN_DIR {bin_dir} is not a directory", file = sys.stderr)
         return 2
 
-    files = _collect(bin_dir)
+    files = _collect(bin_dir, os.environ.get("KEEP_LAYOUT", "").strip() == "1")
     have_cli = any(f.name in ("sd-cli", "sd-cli.exe") for f, _ in files)
     if not have_cli:
         print(f"package_bundle: no sd-cli under {bin_dir}; refusing to package", file = sys.stderr)
@@ -124,7 +114,7 @@ def main() -> int:
     zip_path.unlink(missing_ok = True)
     with zipfile.ZipFile(zip_path, "w", compression = zipfile.ZIP_DEFLATED) as zf:
         for f, name in files:
-            # Flat under sd-<tag>-bin-<label>/ regardless of build layout; kernel trees keep their path.
+            # Under sd-<tag>-bin-<label>/, flat unless KEEP_LAYOUT.
             zf.write(f, arcname = f"{stem}/{name}")
         zf.writestr(f"{stem}/UNSLOTH_BUILD.txt", provenance)
         if license_file and Path(license_file).is_file():
