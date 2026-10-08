@@ -17,10 +17,8 @@ name: Unsloth SD prebuilt (CPU/Apple/CUDA/Vulkan/ROCm)
 #   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64, Linux Vulkan.
 #   build-windows-- Windows x64 CPU + Vulkan (MSVC + Ninja).
 #   build-linux-cuda -- Linux x64, CUDA 12.8, best effort (continue-on-error).
-#   build-linux-rocm -- Linux x64, ROCm 7.14.0 with its userspace bundled, same best-effort
-#                   rule as CUDA. Without it an AMD Linux host that asks for rocm gets an
-#                   upstream build that lacks the MiniMax-H3 fixes, and when that one does
-#                   not come up, the CPU build (unsloth#8814).
+#   build-linux-rocm -- Linux x64, ROCm 7.14.0 with its userspace bundled, best effort
+#                   like CUDA. Without it AMD Linux hosts fall back to upstream or CPU (unsloth#8814).
 #   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
 #                   draft->publish. If any CPU/Apple/Vulkan leg fails, assemble
 #                   is skipped and nothing is published (the Studio needs the full
@@ -673,13 +671,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Linux ROCm, built against AMD's TheRock wheels like upstream's build.yml, with one
-  # difference that decides whether it runs at all: the ROCm userspace the binary was linked
-  # against ships in the bundle. Upstream's ROCm zip does not, so it dies on a host whose
-  # ROCm is a different version or absent, which is how the unsloth#8814 reporter's install
-  # went from "installed" to "load_failed" in one second. Same shape as unslothai/llama.cpp's
-  # ROCm leg: libamdhip64, hipblas, rocblas and rocblas/library beside the binaries, rpath
-  # $ORIGIN, so only the kernel driver has to come from the host.
+  # Linux ROCm from TheRock wheels like upstream's build.yml, but the linked ROCm userspace ships
+  # in the bundle with rpath $ORIGIN: upstream's zip dies on a host whose ROCm differs or is
+  # absent (unsloth#8814). Only the kernel driver comes from the host.
   build-linux-rocm:
     name: Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
     needs: resolve
@@ -777,18 +771,16 @@ jobs:
         run: |
           set -euo pipefail
           BIN="${GITHUB_WORKSPACE}/src/build/bin"
-          # Every library the binaries resolve from inside the wheel tree. ldd already walks
-          # the closure, so one pass over the binaries and the shared libs beside them is the
-          # whole list.
-          ldd "$BIN"/sd-cli "$BIN"/sd-server "$BIN"/*.so 2>/dev/null \
+          # ldd walks the closure and ggml is static here. No "$BIN"/*.so: it matches nothing,
+          # and ldd failing on the literal pattern aborts the step under pipefail.
+          ldd "$BIN"/sd-cli "$BIN"/sd-server 2>/dev/null \
             | awk -v r="$ROCM_PATH/" 'index($3, r) == 1 { print $3 }' | sort -u > "$RUNNER_TEMP/rocm-libs.txt"
           if [ ! -s "$RUNNER_TEMP/rocm-libs.txt" ]; then
             echo "ERROR: nothing resolved from $ROCM_PATH; is this a HIP build?" >&2
             exit 1
           fi
           while read -r so; do cp -L "$so" "$BIN/$(basename "$so")"; done < "$RUNNER_TEMP/rocm-libs.txt"
-          # rocBLAS loads its Tensile kernels from <dir of librocblas>/rocblas/library at
-          # runtime; without that directory every GEMM fails after the load succeeded.
+          # rocBLAS loads its kernels from <dir of librocblas>/rocblas/library at runtime.
           mkdir -p "$BIN/rocblas"
           cp -r "$ROCM_PATH/lib/rocblas/library" "$BIN/rocblas/"
           if ls "$BIN"/libhipblaslt.so* >/dev/null 2>&1 && [ -d "$ROCM_PATH/lib/hipblaslt/library" ]; then

@@ -35,9 +35,7 @@ from pathlib import Path
 # (static builds usually have none; Metal / a shared ggml can add a few).
 _BINARIES = ("sd-cli", "sd-server", "sd-cli.exe", "sd-server.exe")
 _LIB_SUFFIXES = (".dylib", ".so", ".dll", ".metal", ".metallib")
-# Kernel-library trees a ROCm build loads at runtime, relative to the library that owns them
-# (<dir of librocblas>/rocblas/library). Shipped with their layout intact; everything else
-# is flattened.
+# ROCm kernel trees (<dir of librocblas>/rocblas/library) keep their layout; all else is flattened.
 _KERNEL_TREES = ("rocblas", "hipblaslt")
 
 _FINGERPRINT = "Compiled by the Unsloth team"
@@ -126,9 +124,7 @@ def main() -> int:
     zip_path.unlink(missing_ok = True)
     with zipfile.ZipFile(zip_path, "w", compression = zipfile.ZIP_DEFLATED) as zf:
         for f, name in files:
-            # Flatten under the named top-level dir so the binaries sit at
-            # sd-<tag>-bin-<label>/<name> regardless of build layout; only the kernel trees
-            # keep their path.
+            # Flat under sd-<tag>-bin-<label>/ regardless of build layout; kernel trees keep their path.
             zf.write(f, arcname = f"{stem}/{name}")
         zf.writestr(f"{stem}/UNSLOTH_BUILD.txt", provenance)
         if license_file and Path(license_file).is_file():
